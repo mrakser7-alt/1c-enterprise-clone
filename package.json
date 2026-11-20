@@ -1,0 +1,19 @@
+{
+  "name": "1c-enterprise-clone",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Учебная ERP-система для торгового и складского учёта",
+  "workspaces": ["frontend", "backend", "telegram-bot"],
+  "scripts": {
+    "dev": "concurrently -n API,WEB -c yellow,cyan \"npm run dev -w backend\" \"npm run dev -w frontend\"",
+    "build": "npm run build -w backend && npm run build -w frontend && npm run build -w telegram-bot",
+    "typecheck": "npm run typecheck -w backend && npm run typecheck -w frontend && npm run typecheck -w telegram-bot",
+    "start": "npm run start -w backend"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1"
+  },
+  "engines": {
+    "node": ">=22.5"
+  }
+}
