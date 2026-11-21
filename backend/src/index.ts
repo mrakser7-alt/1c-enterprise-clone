@@ -1,17 +1,103 @@
 import cors from "cors";
 import express, { type NextFunction, type Request, type Response } from "express";
+import { compare, hash } from "bcryptjs";
+import { SignJWT, jwtVerify } from "jose";
 import { z } from "zod";
 import { db } from "./db.js";
 
 const app = express();
 const port = Number(process.env.PORT ?? 4000);
+const jwtSecret = process.env.JWT_SECRET;
+if (!jwtSecret || jwtSecret.length < 32) throw new Error("JWT_SECRET must contain at least 32 characters");
+const jwtKey = new TextEncoder().encode(jwtSecret);
+
+type Role = "admin" | "director" | "accountant" | "manager" | "storekeeper";
+type AuthRequest = Request & { auth?: { userId: number; email: string; role: Role } };
 
 app.use(cors());
 app.use(express.json());
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "enterprise-api" }));
 
-app.get("/api/dashboard", (_req, res) => {
+const loginSchema = z.object({
+  email: z.string().email().max(254),
+  password: z.string().min(1).max(200)
+});
+
+app.post("/api/auth/login", async (req, res, next) => {
+  try {
+    const { email, password } = loginSchema.parse(req.body);
+    const user = db.prepare("SELECT id, email, name, password_hash, role FROM users WHERE email = ? AND active = 1")
+      .get(email.trim()) as { id: number; email: string; name: string; password_hash: string; role: Role } | undefined;
+    if (!user || !(await compare(password, user.password_hash))) {
+      res.status(401).json({ error: "Неверный email или пароль" });
+      return;
+    }
+    const token = await new SignJWT({ email: user.email, role: user.role })
+      .setProtectedHeader({ alg: "HS256" })
+      .setSubject(String(user.id))
+      .setIssuedAt()
+      .setExpirationTime("8h")
+      .sign(jwtKey);
+    res.json({ token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+  } catch (error) { next(error); }
+});
+
+app.use("/api", async (req: AuthRequest, res, next) => {
+  if (req.path === "/health" || req.path === "/auth/login") return next();
+  const authorization = req.header("authorization");
+  if (!authorization?.startsWith("Bearer ")) {
+    res.status(401).json({ error: "Требуется авторизация" });
+    return;
+  }
+  try {
+    const { payload } = await jwtVerify(authorization.slice(7), jwtKey, { algorithms: ["HS256"] });
+    if (!payload.sub || typeof payload.email !== "string" || typeof payload.role !== "string") throw new Error("Invalid claims");
+    req.auth = { userId: Number(payload.sub), email: payload.email, role: payload.role as Role };
+    next();
+  } catch {
+    res.status(401).json({ error: "Сессия недействительна или истекла" });
+  }
+});
+
+app.get("/api/auth/me", (req: AuthRequest, res) => {
+  res.json({ userId: req.auth?.userId, email: req.auth?.email, role: req.auth?.role });
+});
+
+function allowRoles(...roles: Role[]) {
+  return (req: AuthRequest, res: Response, next: NextFunction) => {
+    if (!req.auth || !roles.includes(req.auth.role)) {
+      res.status(403).json({ error: "Недостаточно прав для этой операции" });
+      return;
+    }
+    next();
+  };
+}
+
+const createUserSchema = z.object({
+  email: z.string().email().max(254),
+  name: z.string().trim().min(2).max(100),
+  password: z.string().min(12).max(200),
+  role: z.enum(["admin", "director", "accountant", "manager", "storekeeper"])
+});
+
+app.post("/api/auth/users", allowRoles("admin"), async (req, res, next) => {
+  try {
+    const input = createUserSchema.parse(req.body);
+    const passwordHash = await hash(input.password, 12);
+    const result = db.prepare("INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, ?)")
+      .run(input.email.trim(), input.name, passwordHash, input.role);
+    res.status(201).json({ id: Number(result.lastInsertRowid), email: input.email.trim(), name: input.name, role: input.role });
+  } catch (error) {
+    if (error instanceof Error && error.message.includes("UNIQUE constraint failed")) {
+      res.status(409).json({ error: "Пользователь с таким email уже существует" });
+      return;
+    }
+    next(error);
+  }
+});
+
+app.get("/api/dashboard", allowRoles("admin", "director", "accountant", "manager"), (_req, res) => {
   const revenue = db.prepare("SELECT COALESCE(SUM(amount), 0) AS value FROM finance_operations WHERE type = 'income'").get() as { value: number };
   const expenses = db.prepare("SELECT COALESCE(SUM(amount), 0) AS value FROM finance_operations WHERE type = 'expense'").get() as { value: number };
   const stockValue = db.prepare(`
@@ -41,7 +127,7 @@ app.get("/api/dashboard", (_req, res) => {
   });
 });
 
-app.get("/api/products", (_req, res) => {
+app.get("/api/products", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
   const rows = db.prepare(`
     SELECT p.*, COALESCE(SUM(s.quantity), 0) AS stock
     FROM products p LEFT JOIN stock s ON s.product_id = p.id
@@ -50,7 +136,7 @@ app.get("/api/products", (_req, res) => {
   res.json(rows);
 });
 
-app.get("/api/stock", (_req, res) => {
+app.get("/api/stock", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
   const rows = db.prepare(`
     SELECT s.product_id AS productId, p.sku, p.name, p.category,
            s.warehouse_id AS warehouseId, w.name AS warehouse,
@@ -63,7 +149,7 @@ app.get("/api/stock", (_req, res) => {
   res.json(rows);
 });
 
-app.get("/api/partners", (req, res) => {
+app.get("/api/partners", allowRoles("admin", "director", "manager", "accountant"), (req, res) => {
   const type = req.query.type;
   const rows = type === "client" || type === "supplier"
     ? db.prepare("SELECT * FROM partners WHERE type = ? ORDER BY name").all(type)
@@ -71,7 +157,7 @@ app.get("/api/partners", (req, res) => {
   res.json(rows);
 });
 
-app.get("/api/movements", (_req, res) => {
+app.get("/api/movements", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
   const rows = db.prepare(`
     SELECT m.id, m.type, p.name AS product, w.name AS warehouse,
            m.quantity, m.document, m.created_at AS createdAt
@@ -83,7 +169,7 @@ app.get("/api/movements", (_req, res) => {
   res.json(rows);
 });
 
-app.get("/api/finances", (_req, res) => {
+app.get("/api/finances", allowRoles("admin", "director", "accountant"), (_req, res) => {
   const rows = db.prepare(`
     SELECT id, type, category, amount, description, document, created_at AS createdAt
     FROM finance_operations ORDER BY created_at DESC LIMIT 50
@@ -101,7 +187,7 @@ const saleSchema = z.object({
   })).min(1)
 });
 
-app.post("/api/sales", (req, res, next) => {
+app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, next) => {
   try {
     const input = saleSchema.parse(req.body);
     const number = `РН-${String(Date.now()).slice(-6)}`;

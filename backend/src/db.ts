@@ -1,6 +1,7 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { hash } from "bcryptjs";
 
 const dbPath = resolve(process.cwd(), process.env.DATABASE_PATH ?? "data/enterprise.db");
 mkdirSync(dirname(dbPath), { recursive: true });
@@ -9,6 +10,16 @@ export const db = new DatabaseSync(dbPath);
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    email TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    name TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('admin', 'director', 'accountant', 'manager', 'storekeeper')),
+    active INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS products (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sku TEXT NOT NULL UNIQUE,
@@ -84,6 +95,17 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+const bootstrapEmail = process.env.ADMIN_EMAIL?.trim();
+const bootstrapPassword = process.env.ADMIN_PASSWORD;
+if (bootstrapEmail && bootstrapPassword && bootstrapPassword.length >= 12) {
+  const existingAdmin = db.prepare("SELECT id FROM users WHERE email = ?").get(bootstrapEmail);
+  if (!existingAdmin) {
+    const passwordHash = await hash(bootstrapPassword, 12);
+    db.prepare("INSERT INTO users (email, name, password_hash, role) VALUES (?, ?, ?, 'admin')")
+      .run(bootstrapEmail, "Администратор", passwordHash);
+  }
+}
 
 const productsCount = db.prepare("SELECT COUNT(*) AS count FROM products").get() as { count: number };
 
