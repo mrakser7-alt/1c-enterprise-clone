@@ -10,6 +10,12 @@ export const db = new DatabaseSync(dbPath);
 db.exec("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;");
 
 db.exec(`
+  CREATE TABLE IF NOT EXISTS categories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS users (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     email TEXT NOT NULL UNIQUE COLLATE NOCASE,
@@ -94,6 +100,11 @@ db.exec(`
     document TEXT,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
+`);
+
+db.exec(`
+  INSERT OR IGNORE INTO categories (name)
+  SELECT DISTINCT category FROM products WHERE TRIM(category) <> '';
 `);
 
 const bootstrapEmail = process.env.ADMIN_EMAIL?.trim();

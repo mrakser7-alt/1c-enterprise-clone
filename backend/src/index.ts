@@ -81,6 +81,154 @@ const createUserSchema = z.object({
   role: z.enum(["admin", "director", "accountant", "manager", "storekeeper"])
 });
 
+const categorySchema = z.object({ name: z.string().trim().min(2).max(80) });
+const productSchema = z.object({
+  sku: z.string().trim().min(2).max(40),
+  name: z.string().trim().min(2).max(160),
+  category: z.string().trim().min(2).max(80),
+  unit: z.string().trim().min(1).max(16).default("шт."),
+  purchase_price: z.number().finite().min(0),
+  sale_price: z.number().finite().min(0),
+  min_stock: z.number().int().min(0).default(0)
+});
+const warehouseSchema = z.object({
+  name: z.string().trim().min(2).max(120),
+  address: z.string().trim().min(2).max(240),
+  responsible: z.string().trim().min(2).max(100)
+});
+const partnerSchema = z.object({
+  type: z.enum(["client", "supplier"]),
+  name: z.string().trim().min(2).max(160),
+  inn: z.string().trim().max(12).optional().default(""),
+  phone: z.string().trim().max(32).optional().default(""),
+  email: z.union([z.string().email().max(254), z.literal("")]).optional().default("")
+});
+
+function handleWriteError(error: unknown, next: NextFunction, res: Response) {
+  if (error instanceof Error && (error.message.includes("UNIQUE constraint failed") || error.message.includes("FOREIGN KEY constraint failed"))) {
+    res.status(error.message.includes("UNIQUE") ? 409 : 409).json({ error: error.message.includes("UNIQUE") ? "Запись с таким значением уже существует" : "Запись используется в документах и не может быть удалена" });
+    return;
+  }
+  next(error);
+}
+
+app.get("/api/categories", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+  res.json(db.prepare("SELECT id, name FROM categories ORDER BY name").all());
+});
+
+app.post("/api/categories", allowRoles("admin", "director", "manager"), (req, res, next) => {
+  try {
+    const { name } = categorySchema.parse(req.body);
+    const result = db.prepare("INSERT INTO categories (name) VALUES (?)").run(name);
+    res.status(201).json({ id: Number(result.lastInsertRowid), name });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.patch("/api/categories/:id", allowRoles("admin", "director", "manager"), (req, res, next) => {
+  try {
+    const { name } = categorySchema.parse(req.body);
+    const result = db.prepare("UPDATE categories SET name = ? WHERE id = ?").run(name, Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Категория не найдена" }); return; }
+    res.json({ id: Number(req.params.id), name });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.delete("/api/categories/:id", allowRoles("admin"), (req, res) => {
+  const result = db.prepare("DELETE FROM categories WHERE id = ?").run(Number(req.params.id));
+  if (!result.changes) { res.status(404).json({ error: "Категория не найдена" }); return; }
+  res.status(204).end();
+});
+
+app.get("/api/warehouses", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+  res.json(db.prepare("SELECT id, name, address, responsible FROM warehouses ORDER BY name").all());
+});
+
+app.post("/api/warehouses", allowRoles("admin", "director", "storekeeper"), (req, res, next) => {
+  try {
+    const input = warehouseSchema.parse(req.body);
+    const result = db.prepare("INSERT INTO warehouses (name, address, responsible) VALUES (?, ?, ?)").run(input.name, input.address, input.responsible);
+    res.status(201).json({ id: Number(result.lastInsertRowid), ...input });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.patch("/api/warehouses/:id", allowRoles("admin", "director", "storekeeper"), (req, res, next) => {
+  try {
+    const input = warehouseSchema.parse(req.body);
+    const result = db.prepare("UPDATE warehouses SET name = ?, address = ?, responsible = ? WHERE id = ?")
+      .run(input.name, input.address, input.responsible, Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Склад не найден" }); return; }
+    res.json({ id: Number(req.params.id), ...input });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.delete("/api/warehouses/:id", allowRoles("admin"), (req, res, next) => {
+  try {
+    const result = db.prepare("DELETE FROM warehouses WHERE id = ?").run(Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Склад не найден" }); return; }
+    res.status(204).end();
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.post("/api/products", allowRoles("admin", "director", "manager"), (req, res, next) => {
+  try {
+    const input = productSchema.parse(req.body);
+    const category = db.prepare("SELECT id FROM categories WHERE name = ? COLLATE NOCASE").get(input.category);
+    if (!category) { res.status(400).json({ error: "Сначала создайте категорию товара" }); return; }
+    const result = db.prepare(`INSERT INTO products (sku, name, category, unit, purchase_price, sale_price, min_stock)
+      VALUES (?, ?, ?, ?, ?, ?, ?)`)
+      .run(input.sku, input.name, input.category, input.unit, input.purchase_price, input.sale_price, input.min_stock);
+    res.status(201).json({ id: Number(result.lastInsertRowid), ...input, stock: 0, active: 1 });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.patch("/api/products/:id", allowRoles("admin", "director", "manager"), (req, res, next) => {
+  try {
+    const input = productSchema.partial().parse(req.body);
+    if (!Object.keys(input).length) { res.status(400).json({ error: "Передайте хотя бы одно поле" }); return; }
+    if (input.category && !db.prepare("SELECT id FROM categories WHERE name = ? COLLATE NOCASE").get(input.category)) {
+      res.status(400).json({ error: "Категория не найдена" }); return;
+    }
+    const fields = Object.keys(input) as Array<keyof typeof input>;
+    const result = db.prepare(`UPDATE products SET ${fields.map((field) => `${field} = ?`).join(", ")} WHERE id = ? AND active = 1`)
+      .run(...fields.map((field) => input[field] ?? null), Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Товар не найден" }); return; }
+    res.json(db.prepare("SELECT * FROM products WHERE id = ?").get(Number(req.params.id)));
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.delete("/api/products/:id", allowRoles("admin", "director"), (req, res) => {
+  const result = db.prepare("UPDATE products SET active = 0 WHERE id = ? AND active = 1").run(Number(req.params.id));
+  if (!result.changes) { res.status(404).json({ error: "Товар не найден" }); return; }
+  res.status(204).end();
+});
+
+app.post("/api/partners", allowRoles("admin", "director", "manager", "accountant"), (req, res, next) => {
+  try {
+    const input = partnerSchema.parse(req.body);
+    const result = db.prepare("INSERT INTO partners (type, name, inn, phone, email) VALUES (?, ?, ?, ?, ?)")
+      .run(input.type, input.name, input.inn, input.phone, input.email);
+    res.status(201).json({ id: Number(result.lastInsertRowid), ...input });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.patch("/api/partners/:id", allowRoles("admin", "director", "manager", "accountant"), (req, res, next) => {
+  try {
+    const input = partnerSchema.parse(req.body);
+    const result = db.prepare("UPDATE partners SET type = ?, name = ?, inn = ?, phone = ?, email = ? WHERE id = ?")
+      .run(input.type, input.name, input.inn, input.phone, input.email, Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Контрагент не найден" }); return; }
+    res.json({ id: Number(req.params.id), ...input });
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
+app.delete("/api/partners/:id", allowRoles("admin", "director"), (req, res, next) => {
+  try {
+    const result = db.prepare("DELETE FROM partners WHERE id = ?").run(Number(req.params.id));
+    if (!result.changes) { res.status(404).json({ error: "Контрагент не найден" }); return; }
+    res.status(204).end();
+  } catch (error) { handleWriteError(error, next, res); }
+});
+
 app.post("/api/auth/users", allowRoles("admin"), async (req, res, next) => {
   try {
     const input = createUserSchema.parse(req.body);
@@ -131,6 +279,7 @@ app.get("/api/products", allowRoles("admin", "director", "manager", "storekeeper
   const rows = db.prepare(`
     SELECT p.*, COALESCE(SUM(s.quantity), 0) AS stock
     FROM products p LEFT JOIN stock s ON s.product_id = p.id
+    WHERE p.active = 1
     GROUP BY p.id ORDER BY p.name
   `).all();
   res.json(rows);

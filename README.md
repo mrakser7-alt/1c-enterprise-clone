@@ -66,8 +66,11 @@ npm run dev -w telegram-bot
 | GET | `/api/health` | состояние сервера |
 | GET | `/api/dashboard` | показатели для главной |
 | GET | `/api/products` | товары и общие остатки |
+| POST/PATCH/DELETE | `/api/products` | создание, изменение и архивирование товара |
+| GET/POST/PATCH/DELETE | `/api/categories` | категории номенклатуры |
+| GET/POST/PATCH/DELETE | `/api/warehouses` | склады |
 | GET | `/api/stock` | остатки по складам |
-| GET | `/api/partners` | клиенты и поставщики |
+| GET/POST/PATCH/DELETE | `/api/partners` | клиенты и поставщики |
 | GET | `/api/movements` | складские движения |
 | GET | `/api/finances` | доходы и расходы |
 | POST | `/api/sales` | проведение продажи |
