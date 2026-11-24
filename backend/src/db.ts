@@ -100,6 +100,15 @@ db.exec(`
     discount REAL NOT NULL DEFAULT 0 CHECK(discount >= 0 AND discount <= 100)
   );
 
+  CREATE TABLE IF NOT EXISTS sale_payments (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    sale_id INTEGER NOT NULL REFERENCES sales(id),
+    amount REAL NOT NULL CHECK(amount > 0),
+    method TEXT NOT NULL CHECK(method IN ('cash', 'card', 'transfer')),
+    reference TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
   CREATE TABLE IF NOT EXISTS movements (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL CHECK(type IN ('receipt', 'sale', 'transfer', 'inventory')),
@@ -120,6 +129,9 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 `);
+
+const salesColumns = new Set((db.prepare("PRAGMA table_info(sales)").all() as Array<{ name: string }>).map((column) => column.name));
+if (!salesColumns.has("paid_amount")) db.exec("ALTER TABLE sales ADD COLUMN paid_amount REAL NOT NULL DEFAULT 0 CHECK(paid_amount >= 0)");
 
 db.exec(`
   INSERT OR IGNORE INTO categories (name)

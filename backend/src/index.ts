@@ -413,11 +413,34 @@ app.post("/api/purchases/:id/receive", allowRoles("admin", "director", "manager"
 const saleSchema = z.object({
   clientId: z.number().int().positive(),
   warehouseId: z.number().int().positive(),
+  initialPayment: z.number().finite().min(0).optional().default(0),
+  paymentMethod: z.enum(["cash", "card", "transfer"]).optional().default("transfer"),
   items: z.array(z.object({
     productId: z.number().int().positive(),
     quantity: z.number().int().positive(),
     discount: z.number().min(0).max(100).default(0)
   })).min(1)
+});
+
+const paymentSchema = z.object({
+  amount: z.number().finite().positive(),
+  method: z.enum(["cash", "card", "transfer"]),
+  reference: z.string().trim().max(100).optional().default("")
+});
+
+app.get("/api/sales", allowRoles("admin", "director", "manager", "accountant"), (_req, res) => {
+  const rows = db.prepare(`
+    SELECT s.id, s.number, s.client_id AS clientId, p.name AS client,
+           s.warehouse_id AS warehouseId, w.name AS warehouse, s.status, s.total,
+           s.paid_amount AS paidAmount, MAX(s.total - s.paid_amount, 0) AS debt,
+           CASE WHEN s.paid_amount >= s.total THEN 'paid'
+                WHEN s.paid_amount > 0 THEN 'partially_paid' ELSE 'unpaid' END AS paymentStatus,
+           s.created_at AS createdAt
+    FROM sales s JOIN partners p ON p.id = s.client_id
+    JOIN warehouses w ON w.id = s.warehouse_id
+    ORDER BY s.created_at DESC
+  `).all();
+  res.json(rows);
 });
 
 app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, next) => {
@@ -435,10 +458,13 @@ app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, ne
       total += product.price * item.quantity * (1 - item.discount / 100);
       return { ...item, price: product.price };
     });
+    total = Math.round((total + Number.EPSILON) * 100) / 100;
+    if (input.initialPayment > total) { res.status(400).json({ error: "Первоначальная оплата не может превышать сумму продажи" }); return; }
 
     db.exec("BEGIN IMMEDIATE");
     try {
-      const sale = db.prepare("INSERT INTO sales (number, client_id, warehouse_id, total) VALUES (?, ?, ?, ?)").run(number, input.clientId, input.warehouseId, total);
+      const sale = db.prepare("INSERT INTO sales (number, client_id, warehouse_id, total, paid_amount) VALUES (?, ?, ?, ?, ?)")
+        .run(number, input.clientId, input.warehouseId, total, input.initialPayment);
       const saleId = Number(sale.lastInsertRowid);
       const addItem = db.prepare("INSERT INTO sale_items (sale_id, product_id, quantity, price, discount) VALUES (?, ?, ?, ?, ?)");
       const reduceStock = db.prepare("UPDATE stock SET quantity = quantity - ? WHERE product_id = ? AND warehouse_id = ?");
@@ -448,9 +474,12 @@ app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, ne
         reduceStock.run(item.quantity, item.productId, input.warehouseId);
         movement.run(item.productId, input.warehouseId, -item.quantity, number);
       }
-      db.prepare("INSERT INTO finance_operations (type, category, amount, description, document) VALUES ('income', 'Продажи', ?, 'Оплата по реализации', ?)").run(total, number);
+      if (input.initialPayment > 0) {
+        db.prepare("INSERT INTO sale_payments (sale_id, amount, method) VALUES (?, ?, ?)").run(saleId, input.initialPayment, input.paymentMethod);
+        db.prepare("INSERT INTO finance_operations (type, category, amount, description, document) VALUES ('income', 'Продажи', ?, 'Оплата по реализации', ?)").run(input.initialPayment, number);
+      }
       db.exec("COMMIT");
-      res.status(201).json({ id: saleId, number, total });
+      res.status(201).json({ id: saleId, number, status: "completed", total, paidAmount: input.initialPayment, debt: total - input.initialPayment, paymentStatus: input.initialPayment === total ? "paid" : input.initialPayment > 0 ? "partially_paid" : "unpaid" });
     } catch (error) {
       db.exec("ROLLBACK");
       throw error;
@@ -458,6 +487,37 @@ app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, ne
   } catch (error) {
     next(error);
   }
+});
+
+app.get("/api/sales/:id/payments", allowRoles("admin", "director", "accountant", "manager"), (req, res) => {
+  const saleId = Number(req.params.id);
+  const sale = db.prepare("SELECT id FROM sales WHERE id = ?").get(saleId);
+  if (!sale) { res.status(404).json({ error: "Продажа не найдена" }); return; }
+  res.json(db.prepare(`SELECT id, amount, method, reference, created_at AS createdAt
+    FROM sale_payments WHERE sale_id = ? ORDER BY created_at DESC`).all(saleId));
+});
+
+app.post("/api/sales/:id/payments", allowRoles("admin", "director", "manager", "accountant"), (req, res, next) => {
+  try {
+    const saleId = Number(req.params.id);
+    if (!Number.isSafeInteger(saleId) || saleId <= 0) { res.status(400).json({ error: "Некорректный номер продажи" }); return; }
+    const input = paymentSchema.parse(req.body);
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const sale = db.prepare("SELECT number, total, paid_amount AS paidAmount FROM sales WHERE id = ?")
+        .get(saleId) as { number: string; total: number; paidAmount: number } | undefined;
+      if (!sale) { db.exec("ROLLBACK"); res.status(404).json({ error: "Продажа не найдена" }); return; }
+      const balance = Math.round((sale.total - sale.paidAmount + Number.EPSILON) * 100) / 100;
+      if (input.amount > balance) { db.exec("ROLLBACK"); res.status(409).json({ error: `Сумма платежа превышает долг ${balance.toFixed(2)}` }); return; }
+      const payment = db.prepare("INSERT INTO sale_payments (sale_id, amount, method, reference) VALUES (?, ?, ?, ?)")
+        .run(saleId, input.amount, input.method, input.reference);
+      const paidAmount = Math.round((sale.paidAmount + input.amount + Number.EPSILON) * 100) / 100;
+      db.prepare("UPDATE sales SET paid_amount = ? WHERE id = ?").run(paidAmount, saleId);
+      db.prepare("INSERT INTO finance_operations (type, category, amount, description, document) VALUES ('income', 'Продажи', ?, 'Оплата по реализации', ?)").run(input.amount, sale.number);
+      db.exec("COMMIT");
+      res.status(201).json({ id: Number(payment.lastInsertRowid), saleId, amount: input.amount, paidAmount, debt: Math.max(0, sale.total - paidAmount), paymentStatus: paidAmount >= sale.total ? "paid" : "partially_paid" });
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } catch (error) { next(error); }
 });
 
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
