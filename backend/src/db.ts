@@ -72,6 +72,25 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS purchases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    number TEXT NOT NULL UNIQUE,
+    supplier_id INTEGER NOT NULL REFERENCES partners(id),
+    warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+    status TEXT NOT NULL DEFAULT 'draft' CHECK(status IN ('draft', 'received')),
+    total REAL NOT NULL CHECK(total >= 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    received_at TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS purchase_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    purchase_id INTEGER NOT NULL REFERENCES purchases(id) ON DELETE CASCADE,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    quantity INTEGER NOT NULL CHECK(quantity > 0),
+    price REAL NOT NULL CHECK(price >= 0)
+  );
+
   CREATE TABLE IF NOT EXISTS sale_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     sale_id INTEGER NOT NULL REFERENCES sales(id) ON DELETE CASCADE,

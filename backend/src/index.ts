@@ -326,6 +326,90 @@ app.get("/api/finances", allowRoles("admin", "director", "accountant"), (_req, r
   res.json(rows);
 });
 
+const purchaseSchema = z.object({
+  supplierId: z.number().int().positive(),
+  warehouseId: z.number().int().positive(),
+  items: z.array(z.object({
+    productId: z.number().int().positive(),
+    quantity: z.number().int().positive().max(1_000_000),
+    price: z.number().finite().min(0)
+  })).min(1).max(200)
+});
+
+app.get("/api/purchases", allowRoles("admin", "director", "manager", "accountant", "storekeeper"), (_req, res) => {
+  const purchases = db.prepare(`
+    SELECT p.id, p.number, p.supplier_id AS supplierId, partner.name AS supplier,
+           p.warehouse_id AS warehouseId, w.name AS warehouse, p.status, p.total,
+           p.created_at AS createdAt, p.received_at AS receivedAt
+    FROM purchases p
+    JOIN partners partner ON partner.id = p.supplier_id
+    JOIN warehouses w ON w.id = p.warehouse_id
+    ORDER BY p.created_at DESC
+  `).all() as Array<Record<string, unknown> & { id: number }>;
+  const items = db.prepare(`
+    SELECT pi.product_id AS productId, pr.name AS product, pi.quantity, pi.price
+    FROM purchase_items pi JOIN products pr ON pr.id = pi.product_id
+    WHERE pi.purchase_id = ? ORDER BY pi.id
+  `);
+  res.json(purchases.map((purchase) => ({ ...purchase, items: items.all(purchase.id) })));
+});
+
+app.post("/api/purchases", allowRoles("admin", "director", "manager", "accountant"), (req, res, next) => {
+  try {
+    const input = purchaseSchema.parse(req.body);
+    const supplier = db.prepare("SELECT id FROM partners WHERE id = ? AND type = 'supplier'").get(input.supplierId);
+    if (!supplier) { res.status(400).json({ error: "Выберите существующего поставщика" }); return; }
+    const warehouse = db.prepare("SELECT id FROM warehouses WHERE id = ?").get(input.warehouseId);
+    if (!warehouse) { res.status(400).json({ error: "Склад не найден" }); return; }
+    const prepared = input.items.map((item) => {
+      const product = db.prepare("SELECT id FROM products WHERE id = ? AND active = 1").get(item.productId);
+      if (!product) throw new Error(`Товар #${item.productId} не найден или архивирован`);
+      return item;
+    });
+    const total = prepared.reduce((sum, item) => sum + item.quantity * item.price, 0);
+    const number = `ПТ-${String(Date.now()).slice(-8)}`;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = db.prepare("INSERT INTO purchases (number, supplier_id, warehouse_id, total) VALUES (?, ?, ?, ?)")
+        .run(number, input.supplierId, input.warehouseId, total);
+      const purchaseId = Number(result.lastInsertRowid);
+      const insertItem = db.prepare("INSERT INTO purchase_items (purchase_id, product_id, quantity, price) VALUES (?, ?, ?, ?)");
+      for (const item of prepared) insertItem.run(purchaseId, item.productId, item.quantity, item.price);
+      db.exec("COMMIT");
+      res.status(201).json({ id: purchaseId, number, supplierId: input.supplierId, warehouseId: input.warehouseId, status: "draft", total, items: prepared });
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Товар #")) { res.status(400).json({ error: error.message }); return; }
+    handleWriteError(error, next, res);
+  }
+});
+
+app.post("/api/purchases/:id/receive", allowRoles("admin", "director", "manager", "storekeeper"), (req, res, next) => {
+  try {
+    const purchaseId = Number(req.params.id);
+    if (!Number.isSafeInteger(purchaseId) || purchaseId <= 0) { res.status(400).json({ error: "Некорректный номер закупки" }); return; }
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const purchase = db.prepare("SELECT id, number, warehouse_id AS warehouseId, status FROM purchases WHERE id = ?")
+        .get(purchaseId) as { id: number; number: string; warehouseId: number; status: string } | undefined;
+      if (!purchase) { db.exec("ROLLBACK"); res.status(404).json({ error: "Закупка не найдена" }); return; }
+      if (purchase.status !== "draft") { db.exec("ROLLBACK"); res.status(409).json({ error: "Поступление уже проведено" }); return; }
+      const items = db.prepare("SELECT product_id AS productId, quantity FROM purchase_items WHERE purchase_id = ?").all(purchaseId) as Array<{ productId: number; quantity: number }>;
+      if (!items.length) { db.exec("ROLLBACK"); res.status(409).json({ error: "В закупке нет товарных строк" }); return; }
+      const addStock = db.prepare(`INSERT INTO stock (product_id, warehouse_id, quantity) VALUES (?, ?, ?)
+        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = quantity + excluded.quantity`);
+      const movement = db.prepare("INSERT INTO movements (type, product_id, warehouse_id, quantity, document) VALUES ('receipt', ?, ?, ?, ?)");
+      for (const item of items) {
+        addStock.run(item.productId, purchase.warehouseId, item.quantity);
+        movement.run(item.productId, purchase.warehouseId, item.quantity, purchase.number);
+      }
+      db.prepare("UPDATE purchases SET status = 'received', received_at = CURRENT_TIMESTAMP WHERE id = ?").run(purchaseId);
+      db.exec("COMMIT");
+      res.json({ id: purchaseId, number: purchase.number, status: "received", receivedItems: items.length });
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } catch (error) { next(error); }
+});
+
 const saleSchema = z.object({
   clientId: z.number().int().positive(),
   warehouseId: z.number().int().positive(),
