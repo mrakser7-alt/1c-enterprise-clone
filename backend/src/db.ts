@@ -119,6 +119,40 @@ db.exec(`
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
   );
 
+  CREATE TABLE IF NOT EXISTS stock_transfers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    number TEXT NOT NULL UNIQUE,
+    source_warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+    destination_warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+    status TEXT NOT NULL DEFAULT 'completed' CHECK(status = 'completed'),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    CHECK(source_warehouse_id <> destination_warehouse_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS stock_transfer_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    transfer_id INTEGER NOT NULL REFERENCES stock_transfers(id) ON DELETE CASCADE,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    quantity INTEGER NOT NULL CHECK(quantity > 0)
+  );
+
+  CREATE TABLE IF NOT EXISTS inventory_counts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    number TEXT NOT NULL UNIQUE,
+    warehouse_id INTEGER NOT NULL REFERENCES warehouses(id),
+    status TEXT NOT NULL DEFAULT 'completed' CHECK(status = 'completed'),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+  );
+
+  CREATE TABLE IF NOT EXISTS inventory_count_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    inventory_count_id INTEGER NOT NULL REFERENCES inventory_counts(id) ON DELETE CASCADE,
+    product_id INTEGER NOT NULL REFERENCES products(id),
+    expected_quantity INTEGER NOT NULL CHECK(expected_quantity >= 0),
+    counted_quantity INTEGER NOT NULL CHECK(counted_quantity >= 0),
+    difference INTEGER NOT NULL
+  );
+
   CREATE TABLE IF NOT EXISTS finance_operations (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     type TEXT NOT NULL CHECK(type IN ('income', 'expense')),

@@ -306,16 +306,197 @@ app.get("/api/partners", allowRoles("admin", "director", "manager", "accountant"
   res.json(rows);
 });
 
-app.get("/api/movements", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+app.get("/api/movements", allowRoles("admin", "director", "manager", "storekeeper"), (req, res) => {
+  const limit = Math.min(200, Math.max(1, Number(req.query.limit) || 50));
+  const offset = Math.max(0, Number(req.query.offset) || 0);
+  const conditions: string[] = [];
+  const params: Array<string | number> = [];
+  if (["receipt", "sale", "transfer", "inventory"].includes(String(req.query.type))) {
+    conditions.push("m.type = ?"); params.push(String(req.query.type));
+  }
+  for (const field of ["productId", "warehouseId"] as const) {
+    if (req.query[field] !== undefined) {
+      const id = Number(req.query[field]);
+      if (!Number.isSafeInteger(id) || id <= 0) { res.status(400).json({ error: `Некорректный параметр ${field}` }); return; }
+      conditions.push(field === "productId" ? "m.product_id = ?" : "m.warehouse_id = ?"); params.push(id);
+    }
+  }
+  for (const field of ["from", "to"] as const) {
+    if (req.query[field] !== undefined) {
+      const day = String(req.query[field]);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(day) || Number.isNaN(Date.parse(`${day}T00:00:00Z`))) {
+        res.status(400).json({ error: `Параметр ${field} должен иметь формат ГГГГ-ММ-ДД` }); return;
+      }
+      conditions.push(field === "from" ? "date(m.created_at) >= date(?)" : "date(m.created_at) <= date(?)"); params.push(day);
+    }
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+  const total = db.prepare(`SELECT COUNT(*) AS count FROM movements m ${where}`).get(...params) as { count: number };
   const rows = db.prepare(`
     SELECT m.id, m.type, p.name AS product, w.name AS warehouse,
            m.quantity, m.document, m.created_at AS createdAt
     FROM movements m
     JOIN products p ON p.id = m.product_id
     JOIN warehouses w ON w.id = m.warehouse_id
-    ORDER BY m.created_at DESC LIMIT 50
-  `).all();
-  res.json(rows);
+    ${where} ORDER BY m.created_at DESC, m.id DESC LIMIT ? OFFSET ?
+  `).all(...params, limit, offset);
+  res.json({ items: rows, total: total.count, limit, offset });
+});
+
+const stockDocumentItemsSchema = z.array(z.object({
+  productId: z.number().int().positive(),
+  quantity: z.number().int().positive().max(1_000_000)
+})).min(1).max(200);
+
+const transferSchema = z.object({
+  sourceWarehouseId: z.number().int().positive(),
+  destinationWarehouseId: z.number().int().positive(),
+  items: stockDocumentItemsSchema
+}).refine((input) => input.sourceWarehouseId !== input.destinationWarehouseId, {
+  message: "Склады отправления и назначения должны различаться"
+});
+
+app.get("/api/transfers", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+  const rows = db.prepare(`SELECT t.id, t.number, t.source_warehouse_id AS sourceWarehouseId,
+      source.name AS sourceWarehouse, t.destination_warehouse_id AS destinationWarehouseId,
+      destination.name AS destinationWarehouse, t.status, t.created_at AS createdAt,
+      i.product_id AS productId, p.name AS product, i.quantity
+    FROM stock_transfers t
+    JOIN warehouses source ON source.id = t.source_warehouse_id
+    JOIN warehouses destination ON destination.id = t.destination_warehouse_id
+    JOIN stock_transfer_items i ON i.transfer_id = t.id
+    JOIN products p ON p.id = i.product_id
+    ORDER BY t.created_at DESC, t.id DESC`).all() as Array<Record<string, unknown> & { id: number }>;
+  const grouped = new Map<number, Record<string, unknown> & { items: Array<Record<string, unknown>> }>();
+  for (const row of rows) {
+    let transfer = grouped.get(row.id);
+    if (!transfer) {
+      transfer = { id: row.id, number: row.number, sourceWarehouseId: row.sourceWarehouseId,
+        sourceWarehouse: row.sourceWarehouse, destinationWarehouseId: row.destinationWarehouseId,
+        destinationWarehouse: row.destinationWarehouse, status: row.status, createdAt: row.createdAt, items: [] };
+      grouped.set(row.id, transfer);
+    }
+    transfer.items.push({ productId: row.productId, product: row.product, quantity: row.quantity });
+  }
+  res.json([...grouped.values()]);
+});
+
+app.post("/api/transfers", allowRoles("admin", "director", "storekeeper"), (req, res, next) => {
+  try {
+    const input = transferSchema.parse(req.body);
+    if (new Set(input.items.map((item) => item.productId)).size !== input.items.length) {
+      res.status(400).json({ error: "Товар в перемещении указан более одного раза" }); return;
+    }
+    const source = db.prepare("SELECT id FROM warehouses WHERE id = ?").get(input.sourceWarehouseId);
+    const destination = db.prepare("SELECT id FROM warehouses WHERE id = ?").get(input.destinationWarehouseId);
+    if (!source || !destination) { res.status(400).json({ error: "Укажите существующие склады" }); return; }
+    const items = input.items.map((item) => {
+      const product = db.prepare("SELECT id, name FROM products WHERE id = ? AND active = 1").get(item.productId) as { id: number; name: string } | undefined;
+      if (!product) throw new Error(`Товар #${item.productId} не найден или архивирован`);
+      return { ...item, product: product.name };
+    });
+    const number = `ПМ-${String(Date.now()).slice(-8)}`;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const transfer = db.prepare("INSERT INTO stock_transfers (number, source_warehouse_id, destination_warehouse_id) VALUES (?, ?, ?)")
+        .run(number, input.sourceWarehouseId, input.destinationWarehouseId);
+      const transferId = Number(transfer.lastInsertRowid);
+      const sourceBalance = db.prepare("SELECT quantity FROM stock WHERE product_id = ? AND warehouse_id = ?");
+      for (const item of items) {
+        const balance = sourceBalance.get(item.productId, input.sourceWarehouseId) as { quantity: number } | undefined;
+        if (!balance || balance.quantity < item.quantity) throw new Error(`Недостаточно товара «${item.product}» на складе отправления: доступно ${balance?.quantity ?? 0}`);
+      }
+      const insertItem = db.prepare("INSERT INTO stock_transfer_items (transfer_id, product_id, quantity) VALUES (?, ?, ?)");
+      const reduce = db.prepare("UPDATE stock SET quantity = quantity - ? WHERE product_id = ? AND warehouse_id = ? AND quantity >= ?");
+      const add = db.prepare(`INSERT INTO stock (product_id, warehouse_id, quantity) VALUES (?, ?, ?)
+        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = quantity + excluded.quantity`);
+      const movement = db.prepare("INSERT INTO movements (type, product_id, warehouse_id, quantity, document) VALUES ('transfer', ?, ?, ?, ?)");
+      for (const item of items) {
+        insertItem.run(transferId, item.productId, item.quantity);
+        const reduced = reduce.run(item.quantity, item.productId, input.sourceWarehouseId, item.quantity);
+        if (!reduced.changes) throw new Error(`Остаток товара «${item.product}» изменился, повторите перемещение`);
+        add.run(item.productId, input.destinationWarehouseId, item.quantity);
+        movement.run(item.productId, input.sourceWarehouseId, -item.quantity, number);
+        movement.run(item.productId, input.destinationWarehouseId, item.quantity, number);
+      }
+      db.exec("COMMIT");
+      res.status(201).json({ id: transferId, number, sourceWarehouseId: input.sourceWarehouseId,
+        destinationWarehouseId: input.destinationWarehouseId, status: "completed", items });
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Товар #")) { res.status(400).json({ error: error.message }); return; }
+    if (error instanceof Error && error.message.startsWith("Недостаточно товара")) { res.status(409).json({ error: error.message }); return; }
+    handleWriteError(error, next, res);
+  }
+});
+
+const inventoryCountSchema = z.object({
+  warehouseId: z.number().int().positive(),
+  items: z.array(z.object({ productId: z.number().int().positive(), countedQuantity: z.number().int().min(0).max(1_000_000) })).min(1).max(500)
+});
+
+app.get("/api/inventory-counts", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+  const rows = db.prepare(`SELECT c.id, c.number, c.warehouse_id AS warehouseId, w.name AS warehouse,
+      c.status, c.created_at AS createdAt, i.product_id AS productId, p.name AS product,
+      i.expected_quantity AS expectedQuantity, i.counted_quantity AS countedQuantity, i.difference
+    FROM inventory_counts c JOIN warehouses w ON w.id = c.warehouse_id
+    JOIN inventory_count_items i ON i.inventory_count_id = c.id JOIN products p ON p.id = i.product_id
+    ORDER BY c.created_at DESC, c.id DESC`).all() as Array<Record<string, unknown> & { id: number }>;
+  const grouped = new Map<number, Record<string, unknown> & { items: Array<Record<string, unknown>> }>();
+  for (const row of rows) {
+    let count = grouped.get(row.id);
+    if (!count) {
+      count = { id: row.id, number: row.number, warehouseId: row.warehouseId, warehouse: row.warehouse,
+        status: row.status, createdAt: row.createdAt, items: [] };
+      grouped.set(row.id, count);
+    }
+    count.items.push({ productId: row.productId, product: row.product, expectedQuantity: row.expectedQuantity,
+      countedQuantity: row.countedQuantity, difference: row.difference });
+  }
+  res.json([...grouped.values()]);
+});
+
+app.post("/api/inventory-counts", allowRoles("admin", "director", "storekeeper"), (req, res, next) => {
+  try {
+    const input = inventoryCountSchema.parse(req.body);
+    if (!db.prepare("SELECT id FROM warehouses WHERE id = ?").get(input.warehouseId)) {
+      res.status(400).json({ error: "Склад не найден" }); return;
+    }
+    if (new Set(input.items.map((item) => item.productId)).size !== input.items.length) {
+      res.status(400).json({ error: "Товар в инвентаризации указан более одного раза" }); return;
+    }
+    const prepared = input.items.map((item) => {
+      const product = db.prepare("SELECT id, name FROM products WHERE id = ? AND active = 1").get(item.productId) as { id: number; name: string } | undefined;
+      if (!product) throw new Error(`Товар #${item.productId} не найден или архивирован`);
+      return { ...item, name: product.name };
+    });
+    const number = `ИНВ-${String(Date.now()).slice(-8)}`;
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const result = db.prepare("INSERT INTO inventory_counts (number, warehouse_id) VALUES (?, ?)").run(number, input.warehouseId);
+      const countId = Number(result.lastInsertRowid);
+      const balanceQuery = db.prepare("SELECT quantity FROM stock WHERE product_id = ? AND warehouse_id = ?");
+      const insertItem = db.prepare(`INSERT INTO inventory_count_items
+        (inventory_count_id, product_id, expected_quantity, counted_quantity, difference) VALUES (?, ?, ?, ?, ?)`);
+      const setStock = db.prepare(`INSERT INTO stock (product_id, warehouse_id, quantity) VALUES (?, ?, ?)
+        ON CONFLICT(product_id, warehouse_id) DO UPDATE SET quantity = excluded.quantity`);
+      const movement = db.prepare("INSERT INTO movements (type, product_id, warehouse_id, quantity, document) VALUES ('inventory', ?, ?, ?, ?)");
+      const resultItems = prepared.map((item) => {
+        const row = balanceQuery.get(item.productId, input.warehouseId) as { quantity: number } | undefined;
+        const expectedQuantity = row?.quantity ?? 0;
+        const difference = item.countedQuantity - expectedQuantity;
+        insertItem.run(countId, item.productId, expectedQuantity, item.countedQuantity, difference);
+        setStock.run(item.productId, input.warehouseId, item.countedQuantity);
+        if (difference !== 0) movement.run(item.productId, input.warehouseId, difference, number);
+        return { productId: item.productId, product: item.name, expectedQuantity, countedQuantity: item.countedQuantity, difference };
+      });
+      db.exec("COMMIT");
+      res.status(201).json({ id: countId, number, warehouseId: input.warehouseId, status: "completed", items: resultItems });
+    } catch (error) { db.exec("ROLLBACK"); throw error; }
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Товар #")) { res.status(400).json({ error: error.message }); return; }
+    handleWriteError(error, next, res);
+  }
 });
 
 app.get("/api/finances", allowRoles("admin", "director", "accountant"), (_req, res) => {
