@@ -275,6 +275,101 @@ app.get("/api/dashboard", allowRoles("admin", "director", "accountant", "manager
   });
 });
 
+const isCalendarDate = (value?: string) => !value || (
+  !Number.isNaN(Date.parse(`${value}T00:00:00.000Z`)) &&
+  new Date(`${value}T00:00:00.000Z`).toISOString().slice(0, 10) === value
+);
+
+const reportsPeriodSchema = z.object({
+  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional()
+}).refine(({ from, to }) => isCalendarDate(from) && isCalendarDate(to) && (!from || !to || from <= to), {
+  message: "Укажите существующие даты, начало периода не может быть позже его окончания"
+});
+
+app.get("/api/reports", allowRoles("admin", "director", "accountant", "manager"), (req, res) => {
+  const parsedPeriod = reportsPeriodSchema.safeParse(req.query);
+  if (!parsedPeriod.success) {
+    res.status(400).json({ error: "Укажите корректный период в формате ГГГГ-ММ-ДД" });
+    return;
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const from = parsedPeriod.data.from ?? `${today.slice(0, 7)}-01`;
+  const to = parsedPeriod.data.to ?? today;
+
+  const summary = db.prepare(`SELECT COUNT(*) AS salesCount,
+      COALESCE(SUM(s.total), 0) AS revenue,
+      COALESCE(SUM(s.paid_amount), 0) AS received,
+      COALESCE(SUM(MAX(s.total - s.paid_amount, 0)), 0) AS debt
+    FROM sales s WHERE s.status = 'completed' AND date(s.created_at) BETWEEN date(?) AND date(?)`)
+    .get(from, to) as { salesCount: number; revenue: number; received: number; debt: number };
+
+  const revenueByDay = db.prepare(`SELECT date(s.created_at) AS day,
+      ROUND(SUM(s.total), 2) AS revenue, ROUND(SUM(s.paid_amount), 2) AS received,
+      COUNT(*) AS salesCount
+    FROM sales s WHERE s.status = 'completed' AND date(s.created_at) BETWEEN date(?) AND date(?)
+    GROUP BY date(s.created_at) ORDER BY day`)
+    .all(from, to) as Array<{ day: string; revenue: number; received: number; salesCount: number }>;
+
+  const stock = db.prepare(`SELECT p.id AS productId, p.sku, p.name, p.category,
+      s.warehouse_id AS warehouseId, w.name AS warehouse, COALESCE(s.quantity, 0) AS quantity,
+      p.min_stock AS minStock, p.purchase_price AS purchasePrice,
+      COALESCE(total.totalQuantity, 0) AS totalQuantity,
+      COALESCE(total.totalQuantity, 0) <= p.min_stock AS lowStock
+    FROM products p CROSS JOIN warehouses w
+    LEFT JOIN stock s ON s.product_id = p.id AND s.warehouse_id = w.id
+    LEFT JOIN (SELECT product_id, SUM(quantity) AS totalQuantity FROM stock GROUP BY product_id) total
+      ON total.product_id = p.id
+    WHERE p.active = 1 ORDER BY p.name, w.name`).all() as Array<{
+      productId: number; sku: string; name: string; category: string; warehouseId: number;
+      warehouse: string; quantity: number; minStock: number; purchasePrice: number;
+      totalQuantity: number; lowStock: number;
+    }>;
+
+  const stockSummary = db.prepare(`SELECT COALESCE(SUM(s.quantity), 0) AS units,
+      ROUND(COALESCE(SUM(s.quantity * p.purchase_price), 0), 2) AS purchaseValue,
+      COUNT(DISTINCT CASE WHEN COALESCE(totals.totalQuantity, 0) <= p.min_stock THEN p.id END) AS lowStockCount,
+      COUNT(DISTINCT p.id) AS productCount
+    FROM products p LEFT JOIN stock s ON s.product_id = p.id
+    LEFT JOIN (SELECT product_id, SUM(quantity) AS totalQuantity FROM stock GROUP BY product_id) totals
+      ON totals.product_id = p.id WHERE p.active = 1`).get() as {
+        units: number; purchaseValue: number; lowStockCount: number; productCount: number;
+      };
+
+  const stockByWarehouse = db.prepare(`SELECT w.id AS warehouseId, w.name AS warehouse,
+      COUNT(DISTINCT p.id) AS productCount, COALESCE(SUM(s.quantity), 0) AS units,
+      ROUND(COALESCE(SUM(s.quantity * p.purchase_price), 0), 2) AS purchaseValue
+    FROM warehouses w LEFT JOIN stock s ON s.warehouse_id = w.id
+    LEFT JOIN products p ON p.id = s.product_id AND p.active = 1
+    GROUP BY w.id ORDER BY w.name`).all();
+
+  const popularProducts = db.prepare(`SELECT p.id AS productId, p.sku, p.name,
+      SUM(si.quantity) AS quantitySold,
+      ROUND(SUM(si.quantity * si.price * (1 - si.discount / 100.0)), 2) AS revenue,
+      COUNT(DISTINCT si.sale_id) AS salesCount
+    FROM sale_items si JOIN sales s ON s.id = si.sale_id
+    JOIN products p ON p.id = si.product_id
+    WHERE s.status = 'completed' AND date(s.created_at) BETWEEN date(?) AND date(?)
+    GROUP BY p.id ORDER BY quantitySold DESC, revenue DESC, p.name LIMIT 10`)
+    .all(from, to);
+
+  res.json({
+    period: { from, to },
+    summary: {
+      salesCount: summary.salesCount,
+      revenue: summary.revenue,
+      received: summary.received,
+      debt: summary.debt,
+      averageCheck: summary.salesCount ? Math.round((summary.revenue / summary.salesCount) * 100) / 100 : 0
+    },
+    revenueByDay,
+    stockSummary,
+    stockByWarehouse,
+    stock,
+    popularProducts
+  });
+});
+
 app.get("/api/products", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
   const rows = db.prepare(`
     SELECT p.*, COALESCE(SUM(s.quantity), 0) AS stock
