@@ -370,7 +370,7 @@ app.get("/api/reports", allowRoles("admin", "director", "accountant", "manager")
   });
 });
 
-app.get("/api/products", allowRoles("admin", "director", "manager", "storekeeper"), (_req, res) => {
+app.get("/api/products", allowRoles("admin", "director", "accountant", "manager", "storekeeper"), (_req, res) => {
   const rows = db.prepare(`
     SELECT p.*, COALESCE(SUM(s.quantity), 0) AS stock
     FROM products p LEFT JOIN stock s ON s.product_id = p.id
