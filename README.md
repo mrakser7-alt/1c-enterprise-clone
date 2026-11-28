@@ -28,6 +28,8 @@ npm install
 npm run dev
 ```
 
+Для запуска автоматических API-проверок используйте `npm test`. Тесты поднимают отдельный сервер с временной SQLite-базой и удаляют её после завершения.
+
 Интерфейс: `http://localhost:5173`  
 API: `http://localhost:4000/api`  
 Проверка API: `http://localhost:4000/api/health`

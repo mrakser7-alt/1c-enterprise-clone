@@ -14,8 +14,14 @@ const jwtKey = new TextEncoder().encode(jwtSecret);
 type Role = "admin" | "director" | "accountant" | "manager" | "storekeeper";
 type AuthRequest = Request & { auth?: { userId: number; email: string; role: Role } };
 
+class ApiError extends Error {
+  constructor(readonly status: number, message: string) {
+    super(message);
+  }
+}
+
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 
 app.get("/api/health", (_req, res) => res.json({ status: "ok", service: "enterprise-api" }));
 
@@ -499,7 +505,7 @@ app.post("/api/transfers", allowRoles("admin", "director", "storekeeper"), (req,
       const sourceBalance = db.prepare("SELECT quantity FROM stock WHERE product_id = ? AND warehouse_id = ?");
       for (const item of items) {
         const balance = sourceBalance.get(item.productId, input.sourceWarehouseId) as { quantity: number } | undefined;
-        if (!balance || balance.quantity < item.quantity) throw new Error(`Недостаточно товара «${item.product}» на складе отправления: доступно ${balance?.quantity ?? 0}`);
+        if (!balance || balance.quantity < item.quantity) throw new ApiError(409, `Недостаточно товара «${item.product}» на складе отправления: доступно ${balance?.quantity ?? 0}`);
       }
       const insertItem = db.prepare("INSERT INTO stock_transfer_items (transfer_id, product_id, quantity) VALUES (?, ?, ?)");
       const reduce = db.prepare("UPDATE stock SET quantity = quantity - ? WHERE product_id = ? AND warehouse_id = ? AND quantity >= ?");
@@ -509,7 +515,7 @@ app.post("/api/transfers", allowRoles("admin", "director", "storekeeper"), (req,
       for (const item of items) {
         insertItem.run(transferId, item.productId, item.quantity);
         const reduced = reduce.run(item.quantity, item.productId, input.sourceWarehouseId, item.quantity);
-        if (!reduced.changes) throw new Error(`Остаток товара «${item.product}» изменился, повторите перемещение`);
+        if (!reduced.changes) throw new ApiError(409, `Остаток товара «${item.product}» изменился, повторите перемещение`);
         add.run(item.productId, input.destinationWarehouseId, item.quantity);
         movement.run(item.productId, input.sourceWarehouseId, -item.quantity, number);
         movement.run(item.productId, input.destinationWarehouseId, item.quantity, number);
@@ -520,7 +526,7 @@ app.post("/api/transfers", allowRoles("admin", "director", "storekeeper"), (req,
     } catch (error) { db.exec("ROLLBACK"); throw error; }
   } catch (error) {
     if (error instanceof Error && error.message.startsWith("Товар #")) { res.status(400).json({ error: error.message }); return; }
-    if (error instanceof Error && error.message.startsWith("Недостаточно товара")) { res.status(409).json({ error: error.message }); return; }
+    if (error instanceof ApiError) { res.status(error.status).json({ error: error.message }); return; }
     handleWriteError(error, next, res);
   }
 });
@@ -722,14 +728,20 @@ app.get("/api/sales", allowRoles("admin", "director", "manager", "accountant"), 
 app.post("/api/sales", allowRoles("admin", "director", "manager"), (req, res, next) => {
   try {
     const input = saleSchema.parse(req.body);
+    if (!db.prepare("SELECT id FROM partners WHERE id = ? AND type = 'client'").get(input.clientId)) {
+      res.status(400).json({ error: "Клиент не найден" }); return;
+    }
+    if (!db.prepare("SELECT id FROM warehouses WHERE id = ?").get(input.warehouseId)) {
+      res.status(400).json({ error: "Склад не найден" }); return;
+    }
     const number = `РН-${String(Date.now()).slice(-6)}`;
     let total = 0;
     const prepared = input.items.map((item) => {
       const product = db.prepare("SELECT id, name, sale_price AS price FROM products WHERE id = ? AND active = 1").get(item.productId) as { id: number; name: string; price: number } | undefined;
-      if (!product) throw new Error(`Товар #${item.productId} не найден`);
+      if (!product) throw new ApiError(400, `Товар #${item.productId} не найден`);
       const balance = db.prepare("SELECT quantity FROM stock WHERE product_id = ? AND warehouse_id = ?").get(item.productId, input.warehouseId) as { quantity: number } | undefined;
       if (!balance || balance.quantity < item.quantity) {
-        throw new Error(`Недостаточно товара «${product.name}»: доступно ${balance?.quantity ?? 0}`);
+        throw new ApiError(409, `Недостаточно товара «${product.name}»: доступно ${balance?.quantity ?? 0}`);
       }
       total += product.price * item.quantity * (1 - item.discount / 100);
       return { ...item, price: product.price };
@@ -796,11 +808,29 @@ app.post("/api/sales/:id/payments", allowRoles("admin", "director", "manager", "
   } catch (error) { next(error); }
 });
 
+app.use((req, res) => {
+  res.status(404).json({ error: "Маршрут не найден" });
+});
+
 app.use((error: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  const message = error instanceof z.ZodError
-    ? "Некорректные данные документа"
-    : error instanceof Error ? error.message : "Внутренняя ошибка сервера";
-  res.status(error instanceof z.ZodError ? 400 : 422).json({ error: message });
+  if (error instanceof z.ZodError) {
+    res.status(400).json({ error: "Некорректные данные документа" });
+    return;
+  }
+  if (error instanceof ApiError) {
+    res.status(error.status).json({ error: error.message });
+    return;
+  }
+  const parserError = error as { type?: string };
+  if (parserError?.type === "entity.parse.failed") {
+    res.status(400).json({ error: "Некорректный JSON в запросе" });
+    return;
+  }
+  if (parserError?.type === "entity.too.large") {
+    res.status(413).json({ error: "Размер запроса превышает допустимый предел" });
+    return;
+  }
+  res.status(500).json({ error: "Внутренняя ошибка сервера" });
 });
 
 app.listen(port, () => {
